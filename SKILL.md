@@ -1,6 +1,6 @@
 ---
 name: extract-this
-description: 'Extrahera text och material ur VILKA dokument som helst – PDF (digital, inskannad, korrupt OCR-lager), dåliga scans (journaler, fax, fotokopior, mobilfoton, handskrift), Word/DOC/RTF/ODT, Excel/XLS/ODS/CSV, PowerPoint/PPT, EPUB, HTML, e-post (EML/MSG), bilder – till markdown, text eller jsonl. Använd när Johan vill extrahera, OCR:a, "läsa in", konvertera till markdown/text, bygga kunskapsbas eller sökindex av dokument, plocka ut bilder ur PDF, eller strukturerad data (statblock, besvärjelser, tabeller) ur regelböcker. Triggers: "extrahera", "OCR", "läs in pdf:en", "gör om till markdown", "scannad", "journal", "kunskapsbas", "extract text", "/extract-this".'
+description: 'Extrahera text och material ur VILKA dokument som helst – PDF (digital, inskannad, korrupt OCR-lager), dåliga scans (journaler, fax, fotokopior, mobilfoton, handskrift), Word/DOC/RTF/ODT, Excel/XLS/ODS/CSV, PowerPoint/PPT, EPUB, HTML, e-post (EML/MSG), bilder – till markdown, text eller jsonl. Använd när Johan vill extrahera, OCR:a, "läsa in", konvertera till markdown/text, bygga kunskapsbas eller sökindex av dokument, plocka ut bilder/illustrationer/kartor (även ur inskannade böcker) med bildtexter och korsreferenser, göra Obsidian-noter med bilder, eller strukturerad data (statblock, besvärjelser, tabeller) ur regelböcker. Triggers: "extrahera", "OCR", "läs in pdf:en", "gör om till markdown", "scannad", "journal", "kunskapsbas", "bilder ur pdf", "illustrationer", "extract text", "/extract-this".'
 ---
 
 # extract-this
@@ -20,6 +20,9 @@ dåliga scans: 28 WEG/Darkstryder/EON-böcker, CIA-memon och handskrivna brev/da
 | Vilket dokument som helst → markdown | `python $X/extract.py FIL` |
 | Många filer → en kunskapsbas | `python $X/extract.py MAPP -r --combine kunskap.md` |
 | RAG/sökindex | `--format jsonl` (en post per sida resp. ##-avsnitt) |
+| Bilder/illustrationer/kartor i texten (Claude ska "se" figurer) | `--images` |
+| Till en Obsidian-vault (bildnoter, `![[…]]`) | `--obsidian` |
+| Bilder för tokens/handouts (originalupplösning) | `--images-raw` (+ `--image-dpi 300` för renderat) |
 | Statblock/besvärjelser/tabeller → JSON | `xt.structured` – se `references/structured-recipes.md` |
 | Fylla/slå ihop/dela PDF, formulär | `anthropic-skills:pdf` (inte denna) |
 | Redigera Word | `anthropic-skills:docx` (inte denna) |
@@ -32,7 +35,9 @@ python $X/extract.py bok.pdf --stdout --pages 1-5
 python $X/extract.py MAPP -r -o D:/ut            # speglar undermappar, återupptagbart
 python $X/extract.py scan.pdf --lang swe+eng     # tvinga språk (default auto)
 python $X/extract.py journal.pdf --mark-uncertain   # osäkra OCR-ord som ⟦ord⟧
-python $X/extract.py bok.pdf --images            # inbäddade bilder -> extracted/bok_bilder/
+python $X/extract.py bok.pdf --images            # figurer PLACERADE i texten -> extracted/bok_bilder/
+python $X/extract.py bok.pdf --obsidian          # som --images + ![[…]], ^fig-block, en bildnot per figur
+python $X/extract.py bok.pdf --images-raw        # inbäddade bilder i originalupplösning -> bok_original/
 python $X/extract.py karta.pdf --page-images     # hela sidor som JPEG (kartor, deckplans)
 python $X/extract.py fil.docx --password hemligt
 python $X/extract.py --check                     # beroenden + Tesseract-språk
@@ -42,6 +47,29 @@ python $X/extract.py --check                     # beroenden + Tesseract-språk
 `--dpi 300`, `--format md|txt|jsonl`, `--max-rows 2000`, `--force`, `--no-review`.
 Befintliga utfiler hoppas över (nyare än källan) – en avbruten batch fortsätter där den
 slutade. OCR cachas per sida i `%LOCALAPPDATA%/extract-this/cache/`.
+
+## Bilder och korsreferenser
+
+`--images` / `--obsidian` placerar varje figur där den hör hemma i texten, med bildtext:
+
+| Källa | Hur figurer hittas |
+|---|---|
+| Digital PDF | layoutmodellen (pymupdf4llm): inbäddade bilder **och vektorgrafik** (kartor, diagram) renderas, `caption`-boxen blir bildtext |
+| Inskannad sida | egen detektor på den uträtade sidan: stora täta streck eller textur, textspalter maskas och delar regioner; utklipp i **färg** med samma rotation/uträtning |
+| Word / PowerPoint / EPUB | inbäddade bilder på sin plats; Words formatmall Bildtext/Caption och PowerPoints alt-text blir bildtext |
+
+- Bort filtreras: ikoner/små bilder, helsidesbakgrunder bakom text, statistikrutor där
+  text ligger ovanpå konst (> 12 % ordtäckning), och identiska bilder på ≥ 3 sidor (logotyper).
+- Handskrift och formulärramar blir **inte** figurer (de flaggas för granskning i stället).
+- **Korsreferenser:** "se Figur 3", "Fig. 2", "Bild 4", "Tabell 1" länkas till figuren
+  (om en bildtext bär numret); "se sidan 61" länkas till rätt PDF-sida – den tryckta
+  sidnumreringens förskjutning (omslag, förord) detekteras automatiskt. Bokmärkena överst
+  länkar till sidorna. Sidlänkar bara i md-stil (Obsidian saknar sidankare).
+- Format: `md` → `![bildtext](bok_bilder/…)` + `<a id="fig-s061-01">`; `obsidian` →
+  `![[fil]]` + `^fig-s061-01` + bildnot (`type: bild`, källa, sida, bildtext, kontext);
+  `txt`/`jsonl` → `[Bild s. 61: bildtext]`, jsonl-posten får `"figures": [...]`.
+- **För Claude:** bildfilerna kan läsas med `Read` – titta på dem när en figur behövs för
+  att förstå texten (karta, diagram, tabell som bild).
 
 ## Stora filer
 

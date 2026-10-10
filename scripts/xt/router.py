@@ -34,6 +34,7 @@ class Doc:
     meta: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     outline: list = field(default_factory=list)
+    figures: list[dict] = field(default_factory=list)  # {id, page, file, caption, source, w, h}
 
     @property
     def chars(self) -> int:
@@ -43,7 +44,9 @@ class Doc:
 def extract_file(path, *, pages=None, ocr="auto", lang="auto", engine="auto", dpi=300,
                  images_dir: Path | None = None, page_images=False, max_rows=2000,
                  password=None, effort="best", review_dir: Path | None = None,
-                 mark_uncertain=False) -> Doc:
+                 mark_uncertain=False, figures_dir: Path | None = None, image_dpi: int = 200) -> Doc:
+    """figures_dir: figurer placeras i texten (⟪FIG:id⟫) och sparas där.
+    images_dir: PDF -> inbäddade bilder i originalupplösning (råläge)."""
     path = Path(path)
     ext = path.suffix.lower()
 
@@ -52,18 +55,20 @@ def extract_file(path, *, pages=None, ocr="auto", lang="auto", engine="auto", dp
 
         r = extract_pdf(path, pages=pages, ocr=ocr, lang=lang, engine=engine, dpi=dpi,
                         images_dir=images_dir, page_images=page_images, password=password,
-                        effort=effort, review_dir=review_dir, mark_uncertain=mark_uncertain)
+                        effort=effort, review_dir=review_dir, mark_uncertain=mark_uncertain,
+                        figures_dir=figures_dir, image_dpi=image_dpi)
         secs = [{"page": p.page, "method": p.method, "text": p.text, **({"ocr_conf": round(p.conf, 1)} if p.conf else {})}
                 for p in r.pages]
         meta = dict(r.meta)
         if r.images:
             meta["images"] = [i["file"] for i in r.images]
-        return Doc(path, "pdf", secs, meta, r.warnings, r.outline)
+        return Doc(path, "pdf", secs, meta, r.warnings, r.outline, r.figures)
 
     if ext in OFFICE:
         from .office import extract_office
 
-        md, meta = extract_office(path, images_dir=images_dir, max_rows=max_rows, password=password)
+        md, meta = extract_office(path, images_dir=images_dir, max_rows=max_rows, password=password,
+                                  figures_dir=figures_dir)
         kind = "office"
     elif ext in HTML:
         from .other import extract_html
@@ -72,7 +77,7 @@ def extract_file(path, *, pages=None, ocr="auto", lang="auto", engine="auto", dp
     elif ext in EPUB:
         from .other import extract_epub
         try:
-            md, meta = extract_epub(path)
+            md, meta = extract_epub(path, figures_dir)
         except Exception:  # trasig/ovanlig epub -> PyMuPDF:s sidrendering
             return _epub_via_pymupdf(path, pages, engine)
         kind = "epub"
@@ -103,7 +108,8 @@ def extract_file(path, *, pages=None, ocr="auto", lang="auto", engine="auto", dp
     if isinstance(meta, dict) and meta.get("review"):
         warns.append(f"Låg OCR-konfidens ({meta.get('ocr_conf')}) – läs originalbilden visuellt och rätta")
     method = meta.pop("method", kind) if isinstance(meta, dict) else kind
-    return Doc(path, kind, [{"page": None, "method": method, "text": md}], meta, warns)
+    figs = meta.pop("figures", []) if isinstance(meta, dict) else []
+    return Doc(path, kind, [{"page": None, "method": method, "text": md}], meta, warns, figures=figs)
 
 
 def _epub_via_pymupdf(path, pages, engine) -> Doc:
@@ -125,7 +131,28 @@ def _method_summary(doc: Doc) -> dict:
     return cnt
 
 
-def render_md(doc: Doc, with_frontmatter=True) -> str:
+def _page_to_pdf(doc: Doc):
+    """Tryckt sidnummer -> PDF-sida (1-baserad) via detekterad förskjutning."""
+    off = doc.meta.get("page_offset")
+    if off is None:
+        return None
+    return lambda printed: printed - off + 1
+
+
+def _body(doc: Doc, text: str, style: str, base: Path | None) -> str:
+    from .figures import link_crossrefs, render_figures
+
+    figs = {f["id"]: f for f in doc.figures}
+    if style != "txt":
+        present = {s["page"] for s in doc.sections if s["page"] is not None}
+        text = link_crossrefs(text, doc.figures, style, _page_to_pdf(doc), present)
+    return render_figures(text, figs, style, base)
+
+
+def render_md(doc: Doc, with_frontmatter=True, style: str = "md", base: Path | None = None) -> str:
+    """style: 'md' (vanliga länkar + HTML-ankare för sidor/figurer) eller
+    'obsidian' (![[bild]], blockreferenser ^fig-…). base: utfilens mapp, så att
+    bildlänkarna blir relativa."""
     m = doc.meta
     title = m.get("title") or doc.source.stem
     out = []
@@ -146,6 +173,8 @@ def render_md(doc: Doc, with_frontmatter=True) -> str:
         if m.get("converted_from"):
             fm.append(f"converted_from: {m['converted_from']}")
         fm.append(f"chars: {doc.chars}")
+        if doc.figures:
+            fm.append(f"figures: {len(doc.figures)}")
         if m.get("review"):
             fm.append("review:  # låg OCR-konfidens – läs bilden och rätta texten")
             for pg, r in sorted(m["review"].items(), key=lambda kv: int(kv[0])):
@@ -161,7 +190,8 @@ def render_md(doc: Doc, with_frontmatter=True) -> str:
     if len(doc.outline) >= 3:
         ol = ["<details><summary>Innehåll (PDF-bokmärken)</summary>", ""]
         for lvl, t, pg in doc.outline[:400]:
-            ol.append(f"{'  ' * (lvl - 1)}- {t.strip()} — s. {pg}")
+            ref = f"[s. {pg}](#s{pg})" if style == "md" and doc.kind == "pdf" else f"s. {pg}"
+            ol.append(f"{'  ' * (lvl - 1)}- {t.strip()} — {ref}")
         ol += ["", "</details>"]
         out.append("\n".join(ol))
     review = m.get("review") or {}
@@ -174,9 +204,12 @@ def render_md(doc: Doc, with_frontmatter=True) -> str:
                 rv = review[s["page"]]
                 bits.append(f"GRANSKA ({rv.get('reason') or 'osäker'}): " + (rv.get("image") or "rendera sidan"))
             tag = "<!-- " + " | ".join(bits) + " -->"
-            out.append(tag + ("\n\n" + s["text"] if s["text"].strip() else ""))
+            if style == "md":
+                tag += f'\n<a id="s{s["page"]}"></a>'
+            body = _body(doc, s["text"], style, base)
+            out.append(tag + ("\n\n" + body if body.strip() else ""))
         elif s["text"].strip():
-            out.append(s["text"])
+            out.append(_body(doc, s["text"], style, base))
     return "\n\n".join(out).rstrip() + "\n"
 
 
@@ -212,7 +245,7 @@ def render_txt(doc: Doc) -> str:
     for s in doc.sections:
         if s["page"] is not None:
             out.append(f"--- s. {s['page']} ---")
-        out.append(md_to_plain(s["text"]))
+        out.append(md_to_plain(_body(doc, s["text"], "txt", None)))
     return "\n\n".join(t for t in out if t.strip()).rstrip() + "\n"
 
 
@@ -221,20 +254,24 @@ def iter_jsonl(doc: Doc):
     base = {"source": doc.source.name, "path": str(doc.source)}
     if doc.kind == "pdf" or any(s["page"] is not None for s in doc.sections):
         for s in doc.sections:
-            t = strip_comments(s["text"])
+            t = strip_comments(_body(doc, s["text"], "txt", None))
             if t:
-                yield {**base, "page": s["page"], "method": s["method"], "text": t}
+                rec = {**base, "page": s["page"], "method": s["method"], "text": t}
+                figs = [f["file"] for f in doc.figures if f.get("page") == s["page"]]
+                if figs:
+                    rec["figures"] = figs
+                yield rec
         return
-    text = strip_comments("\n\n".join(s["text"] for s in doc.sections))
+    text = strip_comments(_body(doc, "\n\n".join(s["text"] for s in doc.sections), "txt", None))
     parts = re.split(r"(?m)^(?=#{1,2} )", text)
     for n, part in enumerate(p for p in parts if p.strip()):
         head = part.splitlines()[0].lstrip("#").strip() if part.startswith("#") else None
         yield {**base, "section": n + 1, "heading": head, "text": part.strip()}
 
 
-def render(doc: Doc, fmt: str) -> str:
+def render(doc: Doc, fmt: str, style: str = "md", base: Path | None = None) -> str:
     if fmt == "md":
-        return render_md(doc)
+        return render_md(doc, style=style, base=base)
     if fmt == "txt":
         return render_txt(doc)
     if fmt == "jsonl":

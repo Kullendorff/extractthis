@@ -15,6 +15,10 @@ from .common import SOFFICE_EXE, log, md_table
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_CAP = "\x00CAP\x00"  # intern markör för bildtextstycken (Caption/Beskrivning)
+_IMG_NS = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+           "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+           "v": "urn:schemas-microsoft-com:vml"}
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +187,39 @@ class _Docx:
         self.counters: dict = {}
         self.images_dir, self.stem = images_dir, stem
         self.image_files: list[str] = []
+        self.fig_dir: Path | None = None
+        self.figs: list[dict] = []
+        self._fig_by_rid: dict[str, str] = {}
+
+    def _figure(self, rid: str) -> str | None:
+        """Spara en inbäddad bild (en gång per relation) och returnera platshållaren."""
+        from .figures import fig_id, placeholder
+
+        if rid in self._fig_by_rid:
+            return placeholder(self._fig_by_rid[rid])
+        rel = self.rels.get(rid)
+        if rel is None or rel.is_external or "image" not in rel.reltype:
+            return None
+        part = rel.target_part
+        ext = Path(str(part.partname)).suffix.lower() or ".png"
+        if ext in (".emf", ".wmf"):  # vektor-metafiler kan inte visas i md/Obsidian
+            return None
+        k = len(self.figs) + 1
+        fid = fig_id(None, k)
+        self.fig_dir.mkdir(parents=True, exist_ok=True)
+        fn = self.fig_dir / f"{self.stem}_{k:03d}{ext}"
+        fn.write_bytes(part.blob)
+        w = h = None
+        try:
+            from PIL import Image
+
+            with Image.open(fn) as im:
+                w, h = im.size
+        except Exception:
+            pass
+        self.figs.append({"id": fid, "page": None, "file": str(fn), "caption": "", "source": "docx", "w": w, "h": h})
+        self._fig_by_rid[rid] = fid
+        return placeholder(fid)
 
     def _load_numbering(self) -> dict:
         """(numId, ilvl) -> numFmt ('decimal', 'bullet', ...)."""
@@ -233,6 +270,16 @@ class _Docx:
                         txt.append("-")
                 if txt:
                     yield "".join(txt), b, i, code, link
+                # Inbäddad bild i löptexten (DrawingML a:blip eller gammal VML v:imagedata)
+                if self.fig_dir is not None:
+                    # lxml direkt – python-docx:s egen xpath() tar inte namespaces=
+                    from lxml import etree
+
+                    for rid in etree._Element.xpath(ch, ".//a:blip/@r:embed | .//v:imagedata/@r:id",
+                                                    namespaces=_IMG_NS):
+                        tok = self._figure(rid)
+                        if tok:
+                            yield tok, False, False, False, None
             elif tag == W + "hyperlink":
                 rid = ch.get(R_ID)
                 url = None
@@ -324,6 +371,8 @@ class _Docx:
             return "- " + text
         if re.search(r"quote|citat", style, re.I):
             return "> " + text
+        if re.search(r"caption|beskrivning|bildtext", style, re.I):
+            return _CAP + text  # kopplas till närmast föregående bild i to_markdown
         return text
 
     def table(self, tbl_el) -> str:
@@ -410,7 +459,20 @@ class _Docx:
         return "\n\n".join(out)
 
     def to_markdown(self) -> str:
-        parts = [b for b in self.blocks(self.doc.element.body) if b and b.strip()]
+        from .figures import FIG_RE
+
+        raw = [b for b in self.blocks(self.doc.element.body) if b and b.strip()]
+        parts: list[str] = []
+        for b in raw:
+            if b.startswith(_CAP):
+                cap = b[len(_CAP):].strip()
+                prev = FIG_RE.findall(parts[-1]) if parts else []
+                fig = next((f for f in self.figs if prev and f["id"] == prev[-1]), None)
+                if fig is not None and not fig["caption"]:
+                    fig["caption"] = cap  # bildtexten följer med bilden i stället för som löptext
+                    continue
+                b = cap
+            parts.append(b)
         notes = self.notes()
         if notes:
             parts.append(notes)
@@ -425,13 +487,14 @@ class _Docx:
 
 
 def extract_docx(path, images_dir: Path | None = None, password: str | None = None,
-                 stem: str | None = None) -> tuple[str, dict]:
+                 stem: str | None = None, figures_dir: Path | None = None) -> tuple[str, dict]:
     src = open_maybe_encrypted(path, password) if isinstance(path, (str, Path)) else path
     d = _Docx(src, images_dir, stem or Path(getattr(path, "name", None) or str(path)).stem)
+    d.fig_dir = figures_dir
     md = d.to_markdown()
     imgs = d.images()
     cp = d.doc.core_properties
-    meta = {"title": cp.title or None, "author": cp.author or None, "images": imgs}
+    meta = {"title": cp.title or None, "author": cp.author or None, "images": imgs, "figures": d.figs}
     return md, meta
 
 
@@ -553,12 +616,34 @@ def extract_sheet(path: Path, max_rows: int = 2000, password: str | None = None)
 # PPTX
 # ---------------------------------------------------------------------------
 
-def _shape_md(shape, out: list[str]):
+def _pptx_picture(shape, ctx: dict) -> str | None:
+    """Spara bilden ur en bildform och returnera platshållaren (bildtext = alt-text)."""
+    from .figures import fig_id, placeholder
+
+    try:
+        img = shape.image
+    except Exception:
+        return None
+    if img.ext in ("emf", "wmf"):
+        return None
+    ctx["k"] = ctx.get("k", 0) + 1
+    fid = fig_id(ctx["slide"], ctx["k"])
+    ctx["fig_dir"].mkdir(parents=True, exist_ok=True)
+    fn = ctx["fig_dir"] / f"{ctx['stem']}_bild{ctx['slide']:02d}_{ctx['k']:02d}.{img.ext}"
+    fn.write_bytes(img.blob)
+    descr = shape._element.xpath("./p:nvPicPr/p:cNvPr/@descr")
+    w, h = (img.size if hasattr(img, "size") else (None, None))
+    ctx["figs"].append({"id": fid, "page": ctx["slide"], "file": str(fn), "source": "pptx", "w": w, "h": h,
+                        "caption": descr[0].strip() if descr and descr[0].strip() else ""})
+    return placeholder(fid)
+
+
+def _shape_md(shape, out: list[str], ctx: dict | None = None):
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
     if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
         for s in sorted(shape.shapes, key=lambda s: ((s.top or 0), (s.left or 0))):
-            _shape_md(s, out)
+            _shape_md(s, out, ctx)
         return
     if getattr(shape, "has_table", False) and shape.has_table:
         out.append(md_table([[c.text.strip() for c in r.cells] for r in shape.table.rows]))
@@ -574,6 +659,10 @@ def _shape_md(shape, out: list[str]):
             out.append(f"*Diagram: {title}*")
         return
     if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+        tok = _pptx_picture(shape, ctx) if ctx and ctx.get("fig_dir") is not None else None
+        if tok:
+            out.append(tok)
+            return
         descr = shape._element.xpath("./p:nvPicPr/p:cNvPr/@descr")
         if descr and descr[0].strip():
             out.append(f"*[Bild: {descr[0].strip()}]*")
@@ -588,12 +677,17 @@ def _shape_md(shape, out: list[str]):
             out.append("\n".join(lines))
 
 
-def extract_pptx(path: Path, password: str | None = None) -> tuple[str, dict]:
+def extract_pptx(path: Path, password: str | None = None, figures_dir: Path | None = None,
+                 stem: str | None = None) -> tuple[str, dict]:
     from pptx import Presentation
 
-    prs = Presentation(open_maybe_encrypted(path, password))
+    src = open_maybe_encrypted(path, password) if isinstance(path, (str, Path)) else path
+    prs = Presentation(src)
+    stem = stem or Path(getattr(path, "name", None) or str(path)).stem
+    figs: list[dict] = []
     parts = []
     for n, slide in enumerate(prs.slides, 1):
+        ctx = {"fig_dir": figures_dir, "stem": stem, "slide": n, "figs": figs}
         title_shape = slide.shapes.title
         title = title_shape.text.strip() if title_shape is not None and title_shape.has_text_frame else ""
         parts.append(f"## Bild {n}" + (f": {title}" if title else ""))
@@ -601,13 +695,13 @@ def extract_pptx(path: Path, password: str | None = None) -> tuple[str, dict]:
         for s in sorted(slide.shapes, key=lambda s: ((s.top or 0), (s.left or 0))):
             if title_shape is not None and s.shape_id == title_shape.shape_id:
                 continue
-            _shape_md(s, body)
+            _shape_md(s, body, ctx)
         parts.extend(body)
         if slide.has_notes_slide:
             notes = slide.notes_slide.notes_text_frame.text.strip() if slide.notes_slide.notes_text_frame else ""
             if notes:
                 parts.append("> **Talaranteckningar:** " + notes.replace("\n", "\n> "))
-    return "\n\n".join(parts), {"slides": len(prs.slides)}
+    return "\n\n".join(parts), {"slides": len(prs.slides), "figures": figs}
 
 
 # ---------------------------------------------------------------------------
@@ -645,25 +739,26 @@ def normalize_ooxml(path: Path, kind: str) -> io.BytesIO:
 
 
 def extract_office(path: Path, *, images_dir: Path | None = None, max_rows: int = 2000,
-                   password: str | None = None) -> tuple[str, dict]:
+                   password: str | None = None, figures_dir: Path | None = None) -> tuple[str, dict]:
     ext = Path(path).suffix.lower()
     stem = Path(path).stem
+    fd = figures_dir
     if ext == ".docx":
-        return extract_docx(path, images_dir, password)
+        return extract_docx(path, images_dir, password, figures_dir=fd)
     if ext in (".docm", ".dotx", ".dotm"):
-        return extract_docx(normalize_ooxml(path, "docx"), images_dir, stem=stem)
+        return extract_docx(normalize_ooxml(path, "docx"), images_dir, stem=stem, figures_dir=fd)
     if ext in (".doc", ".rtf", ".odt", ".wpd", ".dot", ".wps"):
-        md, meta = extract_docx(convert_legacy(path, "docx"), images_dir, stem=stem)
+        md, meta = extract_docx(convert_legacy(path, "docx"), images_dir, stem=stem, figures_dir=fd)
         meta["converted_from"] = ext
         return md, meta
     if ext in (".xlsx", ".xlsm", ".xltx", ".xls", ".ods"):
         return extract_sheet(path, max_rows, password)
     if ext == ".pptx":
-        return extract_pptx(path, password)
+        return extract_pptx(path, password, figures_dir=fd)
     if ext in (".pptm", ".ppsx", ".potx", ".ppsm"):
-        return extract_pptx(normalize_ooxml(path, "pptx"))
+        return extract_pptx(normalize_ooxml(path, "pptx"), figures_dir=fd, stem=stem)
     if ext in (".ppt", ".odp", ".pps"):
-        md, meta = extract_pptx(convert_legacy(path, "pptx"))
+        md, meta = extract_pptx(convert_legacy(path, "pptx"), figures_dir=fd, stem=stem)
         meta["converted_from"] = ext
         return md, meta
     raise ValueError(f"Inte ett Office-format: {ext}")

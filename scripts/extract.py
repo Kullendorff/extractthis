@@ -98,8 +98,16 @@ def main() -> int:
     ap.add_argument("--no-review", action="store_true", help="spara inte granskningsbilder för osäkra sidor")
     ap.add_argument("--engine", choices=["auto", "layout", "plain"], default="auto",
                     help="PDF-textlager: layout (pymupdf4llm, struktur) eller plain (snabb råtext)")
-    ap.add_argument("--images", action="store_true", help="spara inbäddade bilder i <utmapp>/<namn>_bilder/")
+    ap.add_argument("--images", action="store_true",
+                    help="figurer PLACERADE i texten med bildtext: digitala bilder, vektorgrafik (kartor, "
+                         "diagram) och illustrationer utklippta ur inskannade sidor -> <namn>_bilder/")
+    ap.add_argument("--images-raw", action="store_true",
+                    help="PDF: alla inbäddade bilder i ORIGINALupplösning (tokens/handouts) -> <namn>_original/")
     ap.add_argument("--page-images", action="store_true", help="rendera HELA sidor som JPEG (kartor, deckplans)")
+    ap.add_argument("--image-dpi", type=int, default=200,
+                    help="upplösning för renderade figurer från digitala PDF:er (default 200; 300+ för tryck/tokens)")
+    ap.add_argument("--obsidian", action="store_true",
+                    help="Obsidian-stil: ![[bild]], blockreferenser och en bildnot per figur")
     ap.add_argument("--max-rows", type=int, default=2000, help="maxrader per kalkylblad/CSV i markdown")
     ap.add_argument("--password", help="lösenord för krypterad PDF/Office-fil")
     ap.add_argument("--force", action="store_true", help="skriv över befintliga utfiler")
@@ -171,12 +179,13 @@ def main() -> int:
         log(f"  -> {f.name}")
         t1 = time.time()
         try:
-            img_dir = (out_root / rel_dir / f"{safe_filename(name)}_bilder") if (a.images or a.page_images) else None
-            rev_dir = None if a.no_review else (out_root / rel_dir / f"{safe_filename(name)}_granska")
+            raw_dir = (out_root / f"{name}_original") if (a.images_raw or a.page_images) else None
+            fig_dir = (out_root / f"{name}_bilder") if (a.images or a.obsidian) else None
+            rev_dir = None if a.no_review else (out_root / f"{name}_granska")
             doc = extract_file(f, pages=a.pages, ocr=a.ocr, lang=a.lang, engine=a.engine, dpi=a.dpi,
-                               images_dir=img_dir, page_images=a.page_images, max_rows=a.max_rows,
+                               images_dir=raw_dir, page_images=a.page_images, max_rows=a.max_rows,
                                password=a.password, effort=a.effort, review_dir=rev_dir,
-                               mark_uncertain=a.mark_uncertain)
+                               mark_uncertain=a.mark_uncertain, figures_dir=fig_dir, image_dpi=a.image_dpi)
         except Exception as e:
             n_fail += 1
             log(f"     FEL: {type(e).__name__}: {e}")
@@ -190,10 +199,12 @@ def main() -> int:
         if doc.chars < 20:
             log("     [!] nästan ingen text extraherad")
 
+        style = "obsidian" if a.obsidian else "md"
         if sink is not None:
+            base = a.combine.parent if a.combine else None
             if a.format == "md":
-                piece = (render_md(doc) if (a.stdout and len(files) == 1)
-                         else f"<!-- källa: {f} -->\n" + render_md(doc, with_frontmatter=False))
+                piece = (render_md(doc, style=style, base=base) if (a.stdout and len(files) == 1)
+                         else f"<!-- källa: {f} -->\n" + render_md(doc, with_frontmatter=False, style=style, base=base))
             elif a.format == "txt":
                 piece = (f"===== {f.name} =====\n\n" if len(files) > 1 else "") + render_txt(doc)
             else:
@@ -205,7 +216,14 @@ def main() -> int:
             first = False
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(render(doc, a.format), encoding="utf-8")
+            target.write_text(render(doc, a.format, style=style, base=target.parent), encoding="utf-8")
+            if a.obsidian and doc.figures:
+                from xt.figures import write_obsidian_notes
+
+                pages = {s["page"]: s["text"] for s in doc.sections}
+                n_notes = write_obsidian_notes(doc.figures, out_root / f"{name}_bilder", target.stem, pages,
+                                               f.name, force=a.force)
+                log(f"     {n_notes} bildnoter")
 
         n_ok += 1
         methods = {}
@@ -213,9 +231,11 @@ def main() -> int:
             methods[s["method"]] = methods.get(s["method"], 0) + 1
         rec = {"file": str(f), "ok": True, "out": None if (a.stdout or a.combine) else str(target),
                "chars": doc.chars, "methods": methods, "warnings": doc.warnings,
-               "review": doc.meta.get("review") or {}, "seconds": round(time.time() - t1, 1)}
+               "review": doc.meta.get("review") or {}, "figures": len(doc.figures),
+               "seconds": round(time.time() - t1, 1)}
         report.append(rec)
-        log(f"     {doc.chars:,} tecken, {methods}, {rec['seconds']}s" + (f" -> {target}" if rec["out"] else ""))
+        log(f"     {doc.chars:,} tecken, {methods}" + (f", {len(doc.figures)} figurer" if doc.figures else "")
+            + f", {rec['seconds']}s" + (f" -> {target}" if rec["out"] else ""))
 
     if a.combine and sink is not None:
         sink.close()

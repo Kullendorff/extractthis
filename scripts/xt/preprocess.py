@@ -95,11 +95,14 @@ def estimate_skew(gray: np.ndarray, max_angle: float = 6.0) -> float:
 
 
 def rotate_small(gray: np.ndarray, angle: float) -> np.ndarray:
+    """Fungerar för både gråskala och färg (H, W, 3) – figurutklipp görs i färg
+    med exakt samma transform som OCR-bilden fick."""
     if not angle or not HAVE_CV:
         return gray
-    h, w = gray.shape
+    h, w = gray.shape[:2]
     m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_CUBIC, borderValue=255)
+    border = 255 if gray.ndim == 2 else (255,) * gray.shape[2]
+    return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_CUBIC, borderValue=border)
 
 
 def normalize_illumination(gray: np.ndarray) -> np.ndarray:
@@ -300,6 +303,41 @@ def _trim_text_edges(box, text_blocks, step_frac: float = 0.015, max_share: floa
     return [x0, y0, x1, y1]
 
 
+def _word_cover(box, words) -> float:
+    """Andel av rutan som täcks av ordrutor helt inuti den."""
+    x0, y0, x1, y1 = box
+    area = max(1, (x1 - x0) * (y1 - y0))
+    s = 0
+    for wd in words:
+        wx0, wy0 = wd["x"], wd["y"]
+        wx1, wy1 = wx0 + wd.get("w", wd["h"]), wy0 + wd["h"]
+        if wx0 >= x0 and wy0 >= y0 and wx1 <= x1 and wy1 <= y1:
+            s += (wx1 - wx0) * (wy1 - wy0)
+    return s / area
+
+
+def _trim_word_rows(box, words, frac: float = 0.12):
+    """Tälj bort textrader i rutans topp/botten ("too many." ovanför en
+    serieruta): ett riktigt ord som ligger inom de yttersta 12 % flyttar kanten
+    förbi sig. Upprepas tills inga sådana ord finns kvar."""
+    x0, y0, x1, y1 = box
+    for _ in range(20):
+        bh = y1 - y0
+        moved = False
+        for wd in words:
+            wx0, wy0 = wd["x"], wd["y"]
+            wx1, wy1 = wx0 + wd.get("w", wd["h"]), wy0 + wd["h"]
+            if wx1 < x0 or wx0 > x1:
+                continue
+            if y0 - wd["h"] <= wy0 <= y0 + frac * bh and wy1 > y0:
+                y0, moved = wy1 + int(0.3 * wd["h"]), True
+            elif y1 - frac * bh <= wy1 <= y1 + wd["h"] and wy0 < y1:
+                y1, moved = wy0 - int(0.3 * wd["h"]), True
+        if not moved or y1 - y0 < 10:
+            break
+    return [x0, y0, x1, y1]
+
+
 def _split_on_text(box, text_blocks, min_frac: float = 0.06, share: float = 0.3, depth: int = 0):
     """Dela en kandidatruta längs kolumner/rader som domineras av text. En
     textspalt MITT i en ruta (konst på båda sidor) är en skiljelinje, inte en del
@@ -396,9 +434,20 @@ def find_figures(norm: np.ndarray, words: list[dict]) -> list[list[int]]:
             continue
         for piece in _split_on_text([x, y, x + bw, y + bh], text_blocks):
             cands.append(_trim_text_edges(piece, text_blocks))
+    real_words = [wd for wd in words if id(wd) in real and wd["c"] >= 60]
+    # För kantrensning räcker säkra enskilda ord ("Tatooine." är ett enordsstycke)
+    sure_words = [wd for wd in words if wd["c"] >= 75 and sum(c.isalpha() for c in wd["t"]) >= 3]
     boxes = []
     for x0, y0, x1, y1 in cands:
+        x0, y0, x1, y1 = _trim_word_rows([x0, y0, x1, y1], sure_words)
         x, y, bw, bh = x0, y0, x1 - x0, y1 - y0
+        # minimimått + rimliga proportioner (smala marginalremsor är ingen bild)
+        if bw < 0.15 * w or bh < 0.08 * h or max(bw / max(bh, 1), bh / max(bw, 1)) > 5:
+            continue
+        # Text OVANPÅ konst (statistikruta med bakgrundsbild) är text, inte bild.
+        # Pratbubblor i serier täcker långt under 12 %.
+        if _word_cover([x0, y0, x1, y1], real_words) > 0.12:
+            continue
         if bw < 0.08 * w or bh < 0.06 * h or bw * bh < 0.02 * w * h:
             continue
         region = (slice(y, y + bh), slice(x, x + bw))

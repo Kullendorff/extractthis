@@ -244,6 +244,93 @@ def build_office():
         "Hej! Vi ses kl. 10 på kontoret.\n".encode("utf-8"))
 
 
+def _art(size=(900, 650)):
+    """En "illustration": konturer, skraffering och en tät figur – som en tecknad bild."""
+    img = Image.new("L", size, 255)
+    d = ImageDraw.Draw(img)
+    w, h = size
+    d.rectangle((4, 4, w - 5, h - 5), outline=0, width=6)
+    for k in range(0, w, 14):
+        d.line((k, h * 0.65, k + 60, h - 10), fill=40, width=3)
+    d.ellipse((w * 0.3, h * 0.12, w * 0.7, h * 0.6), outline=0, width=8, fill=170)
+    d.polygon([(w * 0.1, h * 0.9), (w * 0.25, h * 0.3), (w * 0.4, h * 0.9)], outline=0, fill=90)
+    for k in range(40):
+        d.line((w * 0.55 + k * 6, h * 0.65, w * 0.6 + k * 6, h * 0.95), fill=0, width=2)
+    return img
+
+
+def build_figures():
+    import pymupdf
+
+    # 1) Digital PDF: vektorkarta med bildtext + korsreferenser + tryckta sidnummer
+    doc = pymupdf.open()
+    for n in range(1, 6):
+        pg = doc.new_page()
+        pg.insert_text((72, 60), f"Kapitel {n}", fontsize=18)
+        body = ("Stationen ligger i ett asteroidbälte. Se Figur 1 för däcksplanen och läs mer på sidan 4. " * 3
+                if n == 2 else "Vanlig brödtext om stationen och dess besättning. " * 12)
+        pg.insert_textbox(pymupdf.Rect(72, 80, 520, 200), body, fontsize=10)
+        if n == 1:
+            for k in range(40):
+                pg.draw_line((100 + k * 8, 230), (100 + k * 5, 470), color=(0, 0, 0.5), width=1.5)
+            pg.draw_circle((300, 350), 90, color=(0.7, 0, 0), fill=(1, 0.9, 0.8))
+            pg.draw_rect((95, 225, 500, 480), color=(0, 0, 0), width=2)
+            pg.insert_text((150, 498), "Figur 1: Däcksplan för stationen", fontsize=9)
+        # samma logotyp på varje sida -> ska filtreras bort som dekor
+        logo = Image.new("RGB", (120, 120), (20, 60, 160))
+        ImageDraw.Draw(logo).ellipse((10, 10, 110, 110), fill=(240, 200, 0))
+        buf = io.BytesIO()
+        logo.save(buf, "PNG")
+        pg.insert_image(pymupdf.Rect(480, 700, 560, 780), stream=buf.getvalue())
+        pg.insert_text((290, 815), str(n + 2), fontsize=9)  # tryckt sidnr = PDF-sida + 2
+    doc.save(FIX / "figurer_digital.pdf", garbage=3, deflate=True)
+
+    # 2) Inskannad sida: text, illustration, bildtext under bilden
+    page = Image.new("L", (2480, 3508), 255)
+    d = ImageDraw.Draw(page)
+    f = font("times.ttf", 46)
+    y = 220
+    for ln in ["The smuggler's ship was a battered freighter.", "It had seen better days, but it was fast",
+               "enough to outrun most patrol craft in the sector."] * 2:
+        d.text((220, y), ln, font=f, fill=0)
+        y += 80
+    page.paste(_art((1700, 1200)), (380, 760))
+    d.text((380, 1990), "Figure 3: The freighter at Mos Eisley.", font=font("timesi.ttf", 38), fill=0)
+    y = 2150
+    for ln in ["Below the picture the text continues with more", "details about the ship and its owner.",
+               "The captain never trusted anyone on board."] * 2:
+        d.text((220, y), ln, font=f, fill=0)
+        y += 80
+    doc = pymupdf.open()
+    to_pdf_page(doc, noise(page, 6))
+    doc.save(FIX / "figurer_scan.pdf", garbage=3, deflate=True)
+
+    # 3) Word med inbäddad bild + bildtext (formatmall Caption)
+    import docx
+    from docx.shared import Inches
+
+    art = _art((600, 420)).convert("RGB")
+    ap = FIX / "_art.png"
+    art.save(ap)
+    dd = docx.Document()
+    dd.add_paragraph("Text före bilden.")
+    dd.add_picture(str(ap), width=Inches(3))
+    dd.add_paragraph("Figur 2: Skiss av stationen", style="Caption")
+    dd.add_paragraph("Text efter bilden, se Figur 2.")
+    dd.save(FIX / "rapport_bild.docx")
+
+    # 4) PowerPoint med bild + alt-text
+    from pptx import Presentation
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Bildbild"
+    pic = s.shapes.add_picture(str(ap), Inches(1), Inches(2), Inches(4))
+    pic._element.nvPicPr.cNvPr.set("descr", "Skiss av stationen")
+    prs.save(FIX / "presentation_bild.pptx")
+    ap.unlink()
+
+
 def build_legacy():
     """Äldre/öppna format via LibreOffice (hoppas över om det saknas)."""
     import subprocess
@@ -264,6 +351,7 @@ if __name__ == "__main__":
     build_scans()
     build_digital()
     build_office()
+    build_figures()
     build_legacy()
     print("Fixtures i", FIX)
     for f in sorted(FIX.iterdir()):

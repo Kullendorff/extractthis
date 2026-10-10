@@ -46,24 +46,53 @@ def extract_html(path: Path) -> tuple[str, dict]:
     return html_to_md(raw), {"title": m.group(1).strip() if m else None, "encoding": enc}
 
 
-def extract_epub(path: Path) -> tuple[str, dict]:
+_MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+
+
+def extract_epub(path: Path, figures_dir: Path | None = None) -> tuple[str, dict]:
+    import posixpath
+    from urllib.parse import unquote
+
     import ebooklib
     from ebooklib import epub
 
+    from .figures import fig_id, placeholder
+
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
-    parts = []
+    parts, figs, saved = [], [], {}
+    stem = Path(path).stem
+
+    def save_image(item_dir: str, src: str, alt: str) -> str | None:
+        href = posixpath.normpath(posixpath.join(item_dir, unquote(src.split("#")[0])))
+        if href in saved:
+            return placeholder(saved[href])
+        img = book.get_item_with_href(href)
+        if img is None:
+            return None
+        k = len(figs) + 1
+        fid = fig_id(None, k)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        fn = figures_dir / f"{stem}_{k:03d}{Path(href).suffix or '.png'}"
+        fn.write_bytes(img.get_content())
+        figs.append({"id": fid, "page": None, "file": str(fn), "caption": alt.strip(), "source": "epub"})
+        saved[href] = fid
+        return placeholder(fid)
+
     # spine-ordning = bokens läsordning (get_items() ger godtycklig ordning)
     for idref, _linear in book.spine:
         item = book.get_item_with_id(idref)
         if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT:
             continue
         md = html_to_md(item.get_content().decode("utf-8", errors="replace"))
+        if figures_dir is not None:
+            item_dir = posixpath.dirname(item.get_name())
+            md = _MD_IMG_RE.sub(lambda m: save_image(item_dir, m.group(2), m.group(1)) or m.group(0), md)
         if md.strip():
             parts.append(md)
     title = book.get_metadata("DC", "title")
     author = book.get_metadata("DC", "creator")
     return "\n\n---\n\n".join(parts), {"title": title[0][0] if title else None,
-                                         "author": author[0][0] if author else None}
+                                         "author": author[0][0] if author else None, "figures": figs}
 
 
 # ---------------------------------------------------------------------------

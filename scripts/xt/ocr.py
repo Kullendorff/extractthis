@@ -81,7 +81,7 @@ def ocr_image(img, lang: str = "eng+swe", psm: int = 3) -> dict:
     return {"words": words, "width": img.width, "height": img.height, "lang": lang}
 
 
-PIPELINE_VERSION = "r9"
+PIPELINE_VERSION = "r12"
 MAX_RENDER_PX = 4500  # bumpa när ocr_robust ändras -> gammal cache ignoreras
 GOOD_CONF = 82          # medelkonfidens där vi slutar prova fler varianter
 GOOD_COVERAGE = 0.90    # ...OCH minst så stor andel av sidans tecken täckta av ord
@@ -164,6 +164,9 @@ def ocr_robust(img, lang: str = "eng+swe", effort: str = "best") -> dict:
                 break
     best.update(info)
     best["unread_lines"] = pp.unread_lines(norm, best["words"])
+    # Figurrutor i den förbehandlade bildens koordinater (efter rotation/uträtning)
+    best["figures"] = pp.find_figures(norm, best["words"])
+    best["prep_shape"] = list(norm.shape)
     best["attempts"] = attempts
     best["width"], best["height"] = img.width, img.height
     return best
@@ -175,7 +178,8 @@ def _cache_path(fingerprint: str, page_index: int, lang: str, dpi: int, effort: 
 
 
 def ocr_pdf_pages(doc, indices, fingerprint: str, lang: str, dpi: int = 300, workers: int | None = None,
-                  effort: str = "best", review_dir=None, review_stem: str = "sida") -> dict[int, dict]:
+                  effort: str = "best", review_dir=None, review_stem: str = "sida",
+                  figures_dir=None) -> dict[int, dict]:
     """OCR:a valda sidor (0-baserade). Resultat cachas per sida, så en avbruten
     körning på en 300-sidorsbok fortsätter där den slutade.
 
@@ -208,13 +212,12 @@ def ocr_pdf_pages(doc, indices, fingerprint: str, lang: str, dpi: int = 300, wor
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for start in range(0, len(todo), batch):
                 chunk = todo[start:start + batch]
-                images = {}
+                images, effs = {}, {}
                 for i in chunk:
                     # Tak på ~4500 px längsta sida: vissa scans har gigantiska
                     # sidmått (2848x4272 pt -> 211 Mpx vid 300 dpi = krasch).
-                    r = doc[i].rect
-                    eff = min(dpi, int(MAX_RENDER_PX * 72 / max(r.width, r.height, 1)))
-                    pix = doc[i].get_pixmap(dpi=max(eff, 10), colorspace=pymupdf.csGRAY)
+                    effs[i] = eff = render_dpi(doc[i], dpi)
+                    pix = doc[i].get_pixmap(dpi=eff, colorspace=pymupdf.csGRAY)
                     images[i] = Image.open(io.BytesIO(pix.tobytes("png")))
                     del pix
                 # PyMuPDF behåller avkodade scanbilder i sin interna cache (~250 MB
@@ -230,6 +233,7 @@ def ocr_pdf_pages(doc, indices, fingerprint: str, lang: str, dpi: int = 300, wor
                         done += 1
                         continue  # cachas inte – görs om nästa körning
                     res["dpi"] = dpi
+                    res["render_dpi"] = effs[i]
                     cp = _cache_path(fingerprint, i, lang, dpi, effort)
                     cp.parent.mkdir(parents=True, exist_ok=True)
                     cp.write_text(json.dumps(res, ensure_ascii=False), encoding="utf-8")
@@ -250,7 +254,51 @@ def ocr_pdf_pages(doc, indices, fingerprint: str, lang: str, dpi: int = 300, wor
                     doc[i].get_pixmap(dpi=dpi_r).save(str(fn))
                 res["review_image"] = str(fn)
                 res["review_reason"] = review_reason(res)
+    if figures_dir is not None:
+        crop_scan_figures(doc, results, figures_dir, review_stem)
     return results
+
+
+def render_dpi(page, dpi: int) -> int:
+    r = page.rect
+    return max(10, min(dpi, int(MAX_RENDER_PX * 72 / max(r.width, r.height, 1))))
+
+
+def crop_scan_figures(doc, results: dict[int, dict], out_dir, stem: str) -> None:
+    """Klipp ut figurer ur inskannade sidor – i FÄRG, med exakt samma rotation och
+    uträtning som OCR-bilden fick (rutorna ligger i den bildens koordinater).
+    Fyller res['figure_files'] = [{file, box, w, h}]. Körs i huvudtråden (PyMuPDF)."""
+    import numpy as np
+    import pymupdf
+
+    from . import preprocess as pp
+
+    for i, res in sorted(results.items()):
+        boxes = res.get("figures") or []
+        if not boxes or res.get("error"):
+            continue
+        eff = res.get("render_dpi") or render_dpi(doc[i], res.get("dpi", 300))
+        pix = doc[i].get_pixmap(dpi=eff, colorspace=pymupdf.csRGB)
+        arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
+        del pix
+        arr = pp.rotate90(arr, res.get("rotated") or 0)
+        arr = pp.rotate_small(arr, res.get("skew") or 0.0)
+        ph, pw = res.get("prep_shape") or arr.shape[:2]
+        if arr.shape[:2] != (ph, pw):  # säkerhetsnät: skala om rutorna om formen skiljer
+            sy, sx = arr.shape[0] / ph, arr.shape[1] / pw
+            boxes = [[int(b[0] * sx), int(b[1] * sy), int(b[2] * sx), int(b[3] * sy)] for b in boxes]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for k, (x0, y0, x1, y1) in enumerate(boxes, 1):
+            crop = arr[y0:y1, x0:x1]
+            if crop.size == 0:
+                continue
+            fn = out_dir / f"{stem}_s{i + 1:03d}_{k:02d}.jpg"
+            # JPEG q90: inskannat fotografiskt brus komprimerar dåligt som PNG
+            Image.fromarray(crop).save(fn, quality=90)
+            files.append({"file": str(fn), "box": [x0, y0, x1, y1], "w": int(x1 - x0), "h": int(y1 - y0)})
+        res["figure_files"] = files
+        pymupdf.TOOLS.store_shrink(100)
 
 
 UNREAD_LINES_REVIEW = 4  # så många olästa bläckrader -> troligen handskrift
@@ -314,10 +362,81 @@ def paragraphs_from_ocr(res: dict, mark_uncertain: bool = False) -> list[dict]:
             "text": text, "nlines": len(ls),
             "h": sum(l["h"] for l in ls) / len(ls),
             "y": ls[0]["y"], "x": ls[0]["x"],
+            "x1": max(w["x"] + w.get("w", 0) for w in ws), "y1": max(w["y"] + w["h"] for w in ws),
             "c": sum(l["c"] for l in ls) / len(ls),
             "n": len(ws), "solid": sum(w["c"] >= 75 for w in ws) / max(1, len(ws)),
         })
     return out
+
+
+_CAPTION_START_RE = re.compile(r"^(fig(ur|ure)?\.?|bild|illustration|karta|map|diagram|tabell|table|plate)\b", re.I)
+
+
+def _looks_like_caption(p: dict, body_h: float | None) -> bool:
+    """Bildtext: kort, inte sidfot, och antingen mindre stil än brödtexten eller
+    inledd med Figur/Bild/… – annars plockades löptext och sidfoten
+    ("Shadows of the Empire Sourcebook") som bildtext."""
+    t = p["text"].strip().lstrip("■▪●•◆ ")
+    if not t or len(t) > 220 or p["solid"] < 0.5:
+        return False
+    if _CAPTION_START_RE.match(t):
+        return True
+    # En bildtext börjar som en mening – inte mitt i en ("— which seem…", "the galaxy's…")
+    if not (t[0].isupper() or t[0].isdigit() or t[0] in "\"“'‘("):
+        return False
+    return body_h is not None and p["h"] < 0.92 * body_h
+
+
+def place_scan_figures(ps: list[dict], figs: list[dict], page_h: int, page_no: int,
+                       body_h: float | None = None) -> list:
+    """Sortera in figurer bland styckena i läsordning och plocka ut bildtexter.
+
+    Returnerar en lista av stycken och ("FIG", fig)-poster. En figur placeras före
+    första stycke (i läsordning) som börjar under figuren och överlappar den i
+    sidled. Bildtext = kort stycke direkt under figuren (inom ~5 % av sidhöjden);
+    det tas då bort ur löptexten och blir figurens bildtext."""
+    from .figures import fig_id
+
+    items: list = list(ps)
+    for k, f in enumerate(figs, 1):
+        x0, y0, x1, y1 = f["box"]
+        f.setdefault("id", fig_id(page_no, k))
+        f.setdefault("page", page_no)
+        cap_i = None
+        for j, p in enumerate(items):
+            if not isinstance(p, dict) or "text" not in p:
+                continue
+            inside_x = p["x"] >= x0 - 0.02 * page_h and p.get("x1", p["x"]) <= x1 + 0.02 * page_h
+            # rutans utfyllnad kan nå några pixlar ner över bildtextens första rad
+            near = -0.015 * page_h <= p["y"] - y1 <= 0.04 * page_h
+            footer = p["y"] > 0.94 * page_h
+            if inside_x and near and not footer and _looks_like_caption(p, body_h):
+                cap_i = j
+                break
+        if cap_i is not None:
+            cap = items.pop(cap_i)
+            parts = [cap["text"].strip().lstrip("■▪●•◆ ")]
+            bottom = cap.get("y1", cap["y"] + cap["h"])
+            # flerradiga bildtexter: följande stycken med liknande stil tätt under
+            while cap_i < len(items):
+                nxt = items[cap_i]
+                if (not isinstance(nxt, dict) or "text" not in nxt
+                        or not (0 <= nxt["y"] - bottom <= 1.6 * cap["h"])
+                        or abs(nxt["h"] - cap["h"]) > 0.25 * cap["h"]
+                        or nxt["x"] < x0 - 0.02 * page_h or len(" ".join(parts)) > 400):
+                    break
+                parts.append(items.pop(cap_i)["text"].strip())
+                bottom = nxt.get("y1", nxt["y"] + nxt["h"])
+            f["caption"] = " ".join(parts)
+        pos = len(items)
+        for j, p in enumerate(items):
+            if isinstance(p, dict) and "text" in p:
+                overlap = min(x1, p.get("x1", p["x"])) - max(x0, p["x"])
+                if p["y"] >= y1 - 0.01 * page_h and overlap > 0:
+                    pos = j
+                    break
+        items.insert(pos, ("FIG", f))
+    return items
 
 
 _ROMAN_PAGE_RE = re.compile(r"(x{0,3})(ix|iv|v?i{0,3})", re.I)  # i–xxxix, giltiga former
@@ -419,11 +538,19 @@ def ocr_pages_to_markdown(results: dict[int, dict], mark_uncertain: bool = False
         # "120" vara en dos och "vi" ett ord (granskning 2026-10-10).
         pages[i] = [p for k, p in enumerate(ps) if not _is_junk(p["text"], at_edge=k < 2 or k >= n - 2)]
     bh = body_h or body_height(list(pages.values()))
+    from .figures import placeholder
+
     out = {}
     for i, ps in pages.items():
         parts = []
         hidden: list[str] = []
-        for p in ps:
+        figs = results[i].get("figure_files") or []
+        items = (place_scan_figures(ps, figs, (results[i].get("prep_shape") or [3300])[0], i + 1, bh)
+                 if figs else ps)
+        for p in items:
+            if isinstance(p, tuple):  # ("FIG", figur)
+                parts.append(placeholder(p[1]["id"]))
+                continue
             t = p["text"].strip()
             # Andel säkra ord (konf >= 75) per stycke: bildbrus ~0,1, riktig text
             # >= 0,85 (uppmätt WEG40069 s.30/40). Osäkert material KASTAS ALDRIG:

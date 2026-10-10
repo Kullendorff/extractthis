@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import re
 import warnings
 from collections import Counter
@@ -50,6 +51,7 @@ class Result:
     warnings: list[str] = field(default_factory=list)
     outline: list = field(default_factory=list)
     images: list[dict] = field(default_factory=list)
+    figures: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -217,23 +219,124 @@ def _post_layout(md: str) -> str:
     return md.strip()
 
 
-def layout_pages(doc, indices: list[int], batch: int = 25, fallbacks: list | None = None) -> dict[int, str]:
+_IMG_REF_RE = re.compile(r"!\[[^\]]*\]\(([^)]+?-(\d{4})-(\d+)\.(?:png|jpg|jpeg))\)")
+_MD_MARK_RE = re.compile(r"[*_`#>]+")
+
+
+def _text_cover(page, bbox) -> float:
+    """Andel av rutan som täcks av ord (från textlagret) helt inuti den."""
+    x0, y0, x1, y1 = bbox
+    area = max(1.0, (x1 - x0) * (y1 - y0))
+    s = 0.0
+    for wx0, wy0, wx1, wy1, *_ in page.get_text("words"):
+        if wx0 >= x0 and wy0 >= y0 and wx1 <= x1 and wy1 <= y1:
+            s += (wx1 - wx0) * (wy1 - wy0)
+    return s / area
+
+
+def _layout_figures(c: dict, doc, tmp_dir: Path, fig_dir: Path, stem: str, figs_out: list) -> str:
+    """Byt pymupdf4llm:s bildreferenser mot ⟪FIG:id⟫, döp om filerna, koppla
+    bildtext från layoutmodellens 'caption'-box och filtrera bort ikoner och
+    bakgrundsbilder. page_boxes[index] ger bildens ruta (filnamnets -NN = index)."""
+    from .figures import fig_id, placeholder
+
+    md, boxes = c["text"], c.get("page_boxes") or []
+    pno = c["metadata"]["page_number"]
+    page = doc[pno - 1]
+    parea = page.rect.width * page.rect.height or 1
+    k = 0
+    out, last = [], 0
+    caption_raw: list[str] = []
+    for m in _IMG_REF_RE.finditer(md):
+        out.append(md[last:m.start()])
+        last = m.end()
+        src = Path(m.group(1))
+        if not src.is_absolute():
+            src = Path.cwd() / src
+        idx = int(m.group(3))
+        box = boxes[idx] if idx < len(boxes) else None
+        x0, y0, x1, y1 = box["bbox"] if box else (0, 0, 0, 0)
+        bw, bh = x1 - x0, y1 - y0
+        text_chars = len(re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md))
+        tiny = box is not None and (bw < 60 or bh < 40 or bw * bh < 0.01 * parea)
+        background = box is not None and bw * bh > 0.85 * parea and text_chars > 1500
+        # text OVANPÅ konst (statistikruta med bakgrundsbild, WEG40122 s.57) är text
+        texty = box is not None and _text_cover(page, (x0, y0, x1, y1)) > 0.12
+        if tiny or background or texty or not src.exists():
+            try:
+                src.unlink()
+            except OSError:
+                pass
+            continue
+        caption = ""
+        for j in (idx + 1, idx - 1, idx + 2):
+            if 0 <= j < len(boxes) and boxes[j]["class"] == "caption":
+                p0, p1 = boxes[j]["pos"]
+                cand = re.sub(r"\s+", " ", _MD_MARK_RE.sub("", md[p0:p1])).strip()
+                if len(cand) <= 200:  # längre = felklassad textruta (EON s.18 "Lektor: …")
+                    caption = cand
+                    caption_raw.append(md[p0:p1].strip())
+                break
+        k += 1
+        fid = fig_id(pno, k)
+        dst = fig_dir / f"{stem}_s{pno:03d}_{k:02d}{src.suffix}"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        src.replace(dst)
+        figs_out.append({"id": fid, "page": pno, "file": str(dst), "caption": caption, "source": "layout",
+                         "w": round(bw), "h": round(bh), "bbox": [round(v, 1) for v in (x0, y0, x1, y1)]})
+        out.append(placeholder(fid))
+    out.append(md[last:])
+    result = "".join(out)
+    for raw in caption_raw:  # bildtexten flyttas till figuren – inte dubbelt som löptext
+        if raw:
+            result = result.replace(raw, "", 1)
+    return result
+
+
+def layout_pages(doc, indices: list[int], batch: int = 25, fallbacks: list | None = None,
+                 fig_dir: Path | None = None, image_dpi: int = 200, stem: str = "dok",
+                 figs_out: list | None = None) -> dict[int, str]:
     """pymupdf4llm per omgång. Kraschar layoutmotorn på en omgång (t.ex.
     tabelldetektion på en trasig sida) tas just den omgången med plain-motorn –
-    en dålig sida ska inte fälla en hel bok."""
+    en dålig sida ska inte fälla en hel bok.
+
+    fig_dir: bilder OCH vektorgrafik (kartor, diagram) renderas och placeras i
+    läsordning av layoutmodellen."""
     out: dict[int, str] = {}
+    tmp = None
+    if fig_dir is not None:
+        # Egen temp-mapp UTAN mellanslag: pymupdf4llm byter tyst mellanslag mot "_"
+        # i image_path och skriver då till en mapp som inte finns ("Darkstryder
+        # Campaign The Kathol Rift" -> FzErrorSystem, alla bilder förlorade).
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp(prefix="xt_fig_"))
+        if " " in str(tmp):  # t.ex. användarnamn med mellanslag -> rot på samma enhet
+            shutil.rmtree(tmp, ignore_errors=True)
+            root = Path(Path(fig_dir).resolve().anchor) / "xt_tmp"
+            root.mkdir(exist_ok=True)
+            tmp = Path(tempfile.mkdtemp(prefix="xt_fig_", dir=root))
     for s in range(0, len(indices), batch):
         chunk = indices[s:s + batch]
         try:
+            kw = {}
+            if tmp is not None:
+                tmp.mkdir(parents=True, exist_ok=True)
+                kw = {"write_images": True, "image_path": str(tmp), "image_format": "png", "dpi": image_dpi}
             res = pymupdf4llm.to_markdown(doc, pages=chunk, page_chunks=True, use_ocr=False,
-                                          header=False, footer=False, write_images=False)
+                                          header=False, footer=False, **({"write_images": False} | kw))
             for c in res:
-                out[c["metadata"]["page_number"] - 1] = _post_layout(c["text"])
+                text = c["text"]
+                if tmp is not None and figs_out is not None:
+                    text = _layout_figures(c, doc, tmp, fig_dir, stem, figs_out)
+                out[c["metadata"]["page_number"] - 1] = _post_layout(text)
         except Exception as e:
             log(f"    [!] layoutmotorn föll på s. {chunk[0] + 1}-{chunk[-1] + 1} ({type(e).__name__}: {e}) – plain")
             if fallbacks is not None:
                 fallbacks.append((chunk[0] + 1, chunk[-1] + 1))
             out.update(plain_pages(doc, chunk))
+    if tmp is not None:
+        shutil.rmtree(tmp, ignore_errors=True)
     return out
 
 
@@ -385,24 +488,50 @@ def detect_scan_lang(doc, ocr_idx) -> str | None:
 def extract_pdf(path: Path, *, pages: str | None = None, ocr: str = "auto", lang: str = "auto",
                 engine: str = "auto", dpi: int = 300, images_dir: Path | None = None,
                 page_images: bool = False, password: str | None = None, effort: str = "best",
-                review_dir: Path | None = None, mark_uncertain: bool = False) -> Result:
+                review_dir: Path | None = None, mark_uncertain: bool = False,
+                figures_dir: Path | None = None, image_dpi: int = 200) -> Result:
+    """images_dir: inbäddade bilder i ORIGINALupplösning (eller hela sidor med
+    page_images). figures_dir: figurer placerade i texten (digitala bilder,
+    vektorgrafik och illustrationer utklippta ur inskannade sidor)."""
     path = Path(path)
     doc = open_pdf(path, password)
     try:  # stäng alltid – annars förblir källfilen låst (Windows) resten av en batch
         return _extract_open(doc, path, pages=pages, ocr=ocr, lang=lang, engine=engine, dpi=dpi,
                              images_dir=images_dir, page_images=page_images, effort=effort,
-                             review_dir=review_dir, mark_uncertain=mark_uncertain)
+                             review_dir=review_dir, mark_uncertain=mark_uncertain,
+                             figures_dir=figures_dir, image_dpi=image_dpi)
     finally:
         doc.close()
 
 
+def detect_page_offset(doc, idx: list[int], sample: int = 40) -> int | None:
+    """Tryckt sidnummer minus PDF-sidindex (0-baserat), om det är konsekvent.
+    Behövs för korsreferenser: "se sidan 31" i en bok med omslag och förord
+    ligger sällan på PDF-sida 31. Läser ensamma tal i sidornas topp/botten."""
+    if len(idx) < 4:
+        return None
+    step = max(1, len(idx) // sample)
+    offsets: Counter = Counter()
+    for i in idx[::step]:
+        lines = [l.strip() for l in doc[i].get_text().splitlines() if l.strip()]
+        for l in lines[:3] + lines[-3:]:
+            m = re.fullmatch(r"(?:[-–•·]\s*)?(?:sida|page|s\.)?\s*(\d{1,4})\s*(?:[-–•·])?", l, re.I)
+            if m:
+                offsets[int(m.group(1)) - i] += 1
+    if not offsets:
+        return None
+    off, n = offsets.most_common(1)[0]
+    return off if n >= max(3, 0.3 * len(idx[::step])) else None
+
+
 def _extract_open(doc, path: Path, *, pages, ocr, lang, engine, dpi, images_dir, page_images,
-                  effort, review_dir, mark_uncertain) -> Result:
+                  effort, review_dir, mark_uncertain, figures_dir=None, image_dpi=200) -> Result:
     idx = parse_pages(pages, doc.page_count)
     info = classify_doc(doc)
     warns: list[str] = []
     layout_fallbacks: list = []
     ocr_errors: list[int] = []
+    figs: list[dict] = []
 
     if engine == "auto":
         engine = "layout" if HAVE_LAYOUT else "plain"
@@ -432,7 +561,8 @@ def _extract_open(doc, path: Path, *, pages, ocr, lang, engine, dpi, images_dir,
         n_ocr_wanted += len(o_ids)
         if t_ids:
             if engine == "layout":
-                texts.update(layout_pages(doc, t_ids, fallbacks=layout_fallbacks))
+                texts.update(layout_pages(doc, t_ids, fallbacks=layout_fallbacks, fig_dir=figures_dir,
+                                          image_dpi=image_dpi, stem=path.stem, figs_out=figs))
             else:
                 plain_md.update(plain_pages(doc, t_ids))
         if o_ids and ocrmod.HAVE_OCR:
@@ -444,10 +574,14 @@ def _extract_open(doc, path: Path, *, pages, ocr, lang, engine, dpi, images_dir,
                 tl = tesseract_lang(hint) if lang == "auto" else lang
                 fp = file_fingerprint(path)
             res = ocrmod.ocr_pdf_pages(doc, o_ids, fp, tl, dpi, effort=effort,
-                                       review_dir=review_dir, review_stem=path.stem)
+                                       review_dir=review_dir, review_stem=path.stem, figures_dir=figures_dir)
             if bh is None:  # rubrikkalibrering från första blocket MED brödtext, återanvänds sedan
                 bh = ocrmod.body_height([ocrmod.paragraphs_from_ocr(r) for r in res.values()], default=None)
             ocr_md.update(ocrmod.ocr_pages_to_markdown(res, mark_uncertain, body_h=bh))
+            for i in sorted(res):  # ocr_pages_to_markdown har satt id/sida/bildtext
+                for f in res[i].get("figure_files") or []:
+                    if "id" in f:
+                        figs.append({**f, "source": "scan"})
             for i, r in res.items():
                 if r.get("error"):
                     ocr_errors.append(i + 1)
@@ -468,6 +602,15 @@ def _extract_open(doc, path: Path, *, pages, ocr, lang, engine, dpi, images_dir,
 
     texts.update(strip_repeated_edges(plain_md))
     texts.update(strip_repeated_edges(ocr_md))
+
+    if figs:  # logotyper/ornament/sidramar som återkommer identiskt på >= 3 sidor
+        from .figures import FIG_RE, drop_decorations
+
+        dropped = drop_decorations(figs)
+        if dropped:
+            figs = [f for f in figs if f["id"] not in dropped]
+            for i in list(texts):
+                texts[i] = FIG_RE.sub(lambda m: "" if m.group(1) in dropped else m.group(0), texts[i])
     text_idx = [i for i in idx if plan[i] == "text"]
     ocr_idx = [i for i in idx if plan[i] == "ocr"]
     if ocr_idx and not ocrmod.HAVE_OCR:
@@ -509,5 +652,8 @@ def _extract_open(doc, path: Path, *, pages, ocr, lang, engine, dpi, images_dir,
         "author": (doc.metadata or {}).get("author") or None,
         "is_form": bool(doc.is_form_pdf),
         "review": review, "page_fixes": fixes,
+        "page_offset": detect_page_offset(doc, idx),
     }
-    return Result(out_pages, meta, warns, doc.get_toc(), imgs)
+    r = Result(out_pages, meta, warns, doc.get_toc(), imgs)
+    r.figures = figs
+    return r

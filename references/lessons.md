@@ -82,6 +82,31 @@ läsa punkten och köra `pytest` + `bench_ocr.py` efteråt.
 - Minne: texturanalysen görs i 1/4-upplösning; färre förrenderade sidor per omgång.
 - UTF-16/32 känns igen på BOM; e-post med `charset="unknown-8bit"` avkodas som utf-8 (replace).
 
+## Figurer (2026-10-10)
+
+- **pymupdf4llm ger figurer gratis för digitala sidor:** `page_boxes` har klass `picture`
+  (även vektorgrafik!) och `caption`, filnamnets `-NN` = boxindex, `pos` = textposition.
+  Bildtexter > 200 tecken är felklassade textrutor (EON s.18).
+- **Text ovanpå konst ≠ figur:** statistikrutor med bakgrundsbild (WEG40122 s.57) fångas
+  både av layoutmodellen och scandetektorn – förkasta vid > 12 % ordtäckning i rutan.
+- **Scandetektorn – det som inte funkade:**
+  - adaptiv tröskel + utsmetning: bakgrundskonst bakom en textspalt band ihop hela sidan;
+  - global Otsu i stället: handskriften kom tillbaka som figur;
+  - att slå ihop rutor som överlappar: serieruta nere till vänster + konst uppe till höger
+    blev en helsida.
+  Det som funkade: maska *riktiga* textstycken som solida block, dela kandidatrutor längs
+  textdominerade kolumner/rader, kräv ≥ 30 % av bläcket i stora TÄTA komponenter (eller
+  textur), slå bara ihop rutor om resultatet är kompakt, tälj textrader i kanterna.
+- **Tesseract "läser" skräpord inne i teckningar** med konfidens > 60 ("Y=", "Qs", "|") –
+  bara ord ur stycken med ≥ 3 ord och ≥ 50 % säkra räknas som text vid figurdetektion.
+- **Utklipp i färg** måste få exakt samma rotate90 + uträtning som OCR-bilden – rutorna
+  ligger i den förbehandlade bildens koordinater.
+- **Bildtext på scans:** kort, inte sidfot, börjar som en mening, och mindre stil än
+  brödtexten eller "Figur/Bild/…". Flerradiga bildtexter slås ihop. Figurrutans utfyllnad
+  kan nå ner över bildtextens första rad – tillåt liten överlappning.
+- **Tryckt sidnummer ≠ PDF-sida** (omslag, förord): förskjutningen detekteras från ensamma
+  tal i sidkanterna innan "se sidan 61" länkas.
+
 ## Office m.m.
 
 - `<w:b w:val="0"/>` betyder INTE fetstil (gamla skriptet tolkade det som fet).

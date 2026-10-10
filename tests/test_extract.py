@@ -205,7 +205,7 @@ def test_digital_pdf_with_background_image_is_not_ocred():
     assert "Besvärjelser kräver" in text(doc)
     assert len(doc.outline) == 3
     md = render_md(doc)
-    assert "<!-- s. 2 -->" in md and "Kapitel 2 — s. 2" in md
+    assert "<!-- s. 2 -->" in md and "Kapitel 2 — [s. 2](#s2)" in md and '<a id="s2"></a>' in md
 
 
 @pytest.mark.parametrize("name", [
@@ -342,6 +342,81 @@ def test_cli_stdout_and_skip(tmp_path):
     assert (tmp_path / "brev.md").exists() and r1.returncode == 0
     r2 = subprocess.run(exe + [str(FIX / "brev.eml"), "-o", str(tmp_path)], capture_output=True, text=True, encoding="utf-8")
     assert "[SKIP]" in r2.stderr
+
+
+# --------------------------------------------------------------------------- figurer
+def test_digital_figures_vector_caption_crossrefs_and_logo_filter(tmp_path):
+    doc = extract_file(FIX / "figurer_digital.pdf", figures_dir=tmp_path / "b")
+    assert len(doc.figures) == 1, "vektorkartan ska hittas, logotypen (5 sidor) filtreras"
+    f = doc.figures[0]
+    assert f["page"] == 1 and f["caption"].startswith("Figur 1") and Path(f["file"]).exists()
+    assert doc.meta["page_offset"] == 3  # tryckt "3" på PDF-sida 1 (index 0)
+    md = render_md(doc, base=tmp_path)
+    assert "![Figur 1: Däcksplan för stationen](b/" in md
+    assert "Se [Figur 1](#fig-s001-01)" in md
+    assert "[sidan 4](#s2)" in md                       # tryckt sida 4 = PDF-sida 2
+    assert md.count("Däcksplan för stationen") == 2      # alt-text + bildtext, inte även som löptext
+    obs = render_md(doc, style="obsidian", base=tmp_path)
+    assert "![[figurer_digital_s001_01.png]]" in obs and "[[#^fig-s001-01|Figur 1]]" in obs
+
+
+def test_figures_with_spaces_in_paths(tmp_path):
+    """pymupdf4llm byter mellanslag mot '_' i image_path -> alla bilder förlorades
+    för "Darkstryder Campaign The Kathol Rift"."""
+    import shutil
+
+    d = tmp_path / "Mapp med mellanslag"
+    d.mkdir()
+    f = d / "Bok med mellanslag.pdf"
+    shutil.copy(FIX / "figurer_digital.pdf", f)
+    doc = extract_file(f, figures_dir=d / "Bok med mellanslag_bilder")
+    assert len(doc.figures) == 1 and not doc.warnings
+
+
+def test_scan_figure_crop_and_caption(tmp_path):
+    doc = extract_file(FIX / "figurer_scan.pdf", figures_dir=tmp_path)
+    assert len(doc.figures) == 1
+    f = doc.figures[0]
+    assert f["caption"].startswith("Figure 3") and f["source"] == "scan"
+    from PIL import Image
+
+    with Image.open(f["file"]) as im:  # utklippet ~ illustrationen (1700x1200 vid 300 dpi)
+        assert 1500 < im.width < 1900 and 1050 < im.height < 1350
+    t = text(doc)
+    assert "Figure 3" not in t.replace(f"⟪FIG:{f['id']}⟫", "")  # bildtext flyttad, ej löptext
+    assert "battered freighter" in t and "captain never trusted" in t
+
+
+def test_no_false_figures_on_text_and_handwriting_scans(tmp_path):
+    for name in ("scan_ren.pdf", "scan_sned_ojamn.pdf", "scan_fax_en.pdf"):
+        doc = extract_file(FIX / name, figures_dir=tmp_path / name)
+        assert doc.figures == [], name
+
+
+def test_office_figures(tmp_path):
+    d = extract_file(FIX / "rapport_bild.docx", figures_dir=tmp_path / "d")
+    assert len(d.figures) == 1 and d.figures[0]["caption"] == "Figur 2: Skiss av stationen"
+    md = render_md(d, base=tmp_path)
+    assert "se [Figur 2](#fig-f001)" in md and md.index("Text före") < md.index("![") < md.index("Text efter")
+    p = extract_file(FIX / "presentation_bild.pptx", figures_dir=tmp_path / "p")
+    assert len(p.figures) == 1 and p.figures[0]["caption"] == "Skiss av stationen"
+
+
+def test_txt_and_jsonl_reference_figures(tmp_path):
+    doc = extract_file(FIX / "figurer_digital.pdf", figures_dir=tmp_path)
+    assert "[Bild s. 1: Figur 1: Däcksplan för stationen]" in render_txt(doc)
+    recs = list(iter_jsonl(doc))
+    assert recs[0]["figures"] and "⟪FIG" not in "".join(r["text"] for r in recs)
+
+
+def test_obsidian_notes(tmp_path):
+    from xt.figures import write_obsidian_notes
+
+    doc = extract_file(FIX / "figurer_scan.pdf", figures_dir=tmp_path)
+    n = write_obsidian_notes(doc.figures, tmp_path, "figurer_scan", {s["page"]: s["text"] for s in doc.sections},
+                             "figurer_scan.pdf")
+    note = (tmp_path / (Path(doc.figures[0]["file"]).stem + ".md")).read_text(encoding="utf-8")
+    assert n == 1 and "type: bild" in note and "[[figurer_scan#^fig-s001-01" in note and "battered freighter" in note
 
 
 # --------------------------------------------------------------------------- structured

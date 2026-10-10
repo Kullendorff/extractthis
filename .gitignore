@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Genererade testfiler (byggs av tests/make_fixtures.py)
+tests/fixtures/
+# Riktiga testdokument och utdata (upphovsrätt/privat) – committas aldrig
+tests/real/
+extracted/
+*_granska/
+*_bilder/
+_extract_report.json

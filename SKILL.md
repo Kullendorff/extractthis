@@ -1,6 +1,6 @@
 ---
 name: extract-this
-description: Extrahera text och material ur VILKA dokument som helst – PDF (digital, inskannad, korrupt OCR-lager), dåliga scans (journaler, fax, fotokopior, mobilfoton, handskrift), Word/DOC/RTF/ODT, Excel/XLS/ODS/CSV, PowerPoint/PPT, EPUB, HTML, e-post (EML/MSG), bilder – till markdown, text eller jsonl. Använd när Johan vill extrahera, OCR:a, "läsa in", konvertera till markdown/text, bygga kunskapsbas eller sökindex av dokument, plocka ut bilder ur PDF, eller strukturerad data (statblock, besvärjelser, tabeller) ur regelböcker. Triggers: "extrahera", "OCR", "läs in pdf:en", "gör om till markdown", "scannad", "journal", "kunskapsbas", "extract text", "/extract-this".
+description: 'Extrahera text och material ur VILKA dokument som helst – PDF (digital, inskannad, korrupt OCR-lager), dåliga scans (journaler, fax, fotokopior, mobilfoton, handskrift), Word/DOC/RTF/ODT, Excel/XLS/ODS/CSV, PowerPoint/PPT, EPUB, HTML, e-post (EML/MSG), bilder – till markdown, text eller jsonl. Använd när Johan vill extrahera, OCR:a, "läsa in", konvertera till markdown/text, bygga kunskapsbas eller sökindex av dokument, plocka ut bilder ur PDF, eller strukturerad data (statblock, besvärjelser, tabeller) ur regelböcker. Triggers: "extrahera", "OCR", "läs in pdf:en", "gör om till markdown", "scannad", "journal", "kunskapsbas", "extract text", "/extract-this".'
 ---
 
 # extract-this

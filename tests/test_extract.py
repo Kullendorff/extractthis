@@ -33,6 +33,17 @@ def text(doc):
     return "\n".join(s["text"] for s in doc.sections)
 
 
+# --------------------------------------------------------------------------- skill
+def test_skill_frontmatter_is_valid_yaml():
+    """GitHub visade 'mapping values are not allowed' – ett okvoterat 'Triggers: …'."""
+    import yaml
+
+    s = (HERE.parent / "SKILL.md").read_text(encoding="utf-8")
+    m = re.match(r"---\n(.*?)\n---\n", s, re.S)
+    data = yaml.safe_load(m.group(1))
+    assert data["name"] == "extract-this" and len(data["description"]) > 100
+
+
 # --------------------------------------------------------------------------- common
 def test_clean_text_dehyphenation_keeps_och():
     assert common.clean_text("för-\noch nackdelar") == "för- och nackdelar"

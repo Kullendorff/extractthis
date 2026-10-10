@@ -270,6 +270,180 @@ def unread_lines(norm: np.ndarray, words: list[dict]) -> int:
     return bands
 
 
+def _trim_text_edges(box, text_blocks, step_frac: float = 0.015, max_share: float = 0.15):
+    """Tälj bort kantremsor som mest består av text. Bakgrundskonst bakom en
+    textspalt kan hänga ihop med en inramad bild (WEG40122 s.61: serierutans ram
+    nuddar konsten i högerspalten) – då blir kandidaten hela sidan. Remsan med
+    störst textandel skärs bort tills ingen kant har mer än max_share text."""
+    x0, y0, x1, y1 = box
+    H, W = text_blocks.shape
+    sx, sy = max(2, int(step_frac * W)), max(2, int(step_frac * H))
+    for _ in range(400):
+        if x1 - x0 <= 2 * sx or y1 - y0 <= 2 * sy:
+            break
+        edges = {
+            "l": text_blocks[y0:y1, x0:x0 + sx], "r": text_blocks[y0:y1, x1 - sx:x1],
+            "t": text_blocks[y0:y0 + sy, x0:x1], "b": text_blocks[y1 - sy:y1, x0:x1],
+        }
+        share = {k: (v > 0).mean() for k, v in edges.items()}
+        side = max(share, key=share.get)
+        if share[side] <= max_share:
+            break
+        if side == "l":
+            x0 += sx
+        elif side == "r":
+            x1 -= sx
+        elif side == "t":
+            y0 += sy
+        else:
+            y1 -= sy
+    return [x0, y0, x1, y1]
+
+
+def _split_on_text(box, text_blocks, min_frac: float = 0.06, share: float = 0.3, depth: int = 0):
+    """Dela en kandidatruta längs kolumner/rader som domineras av text. En
+    textspalt MITT i en ruta (konst på båda sidor) är en skiljelinje, inte en del
+    av bilden. Rekursivt: först kolumner, sedan rader i varje bit."""
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 4 or y1 - y0 < 4 or depth > 3:
+        return [box]
+    H, W = text_blocks.shape
+    sub = text_blocks[y0:y1, x0:x1] > 0
+    out = []
+    for axis in (0, 1):  # 0: dela på kolumner (andel text per x), 1: på rader
+        prof = sub.mean(axis=axis)
+        textish = prof > share
+        if not textish.any():
+            continue
+        segs, start = [], None
+        for i, t in enumerate(np.append(textish, True)):
+            if not t and start is None:
+                start = i
+            elif t and start is not None:
+                segs.append((start, i))
+                start = None
+        min_len = min_frac * (W if axis == 0 else H)
+        segs = [s for s in segs if s[1] - s[0] >= min_len]
+        for a, b in segs:
+            piece = [x0 + a, y0, x0 + b, y1] if axis == 0 else [x0, y0 + a, x1, y0 + b]
+            out.extend(_split_on_text(piece, text_blocks, min_frac, share, depth + 1))
+        return out
+    return [box]
+
+
+def find_figures(norm: np.ndarray, words: list[dict]) -> list[list[int]]:
+    """Illustrationer på en inskannad sida -> rutor [x0, y0, x1, y1] (i den
+    förbehandlade bildens koordinater).
+
+    Text maskas bort (OCR-ordrutor), resten smetas ihop till regioner. En region
+    räknas som figur om den är stor nog OCH innehåller antingen en stor
+    sammanhängande streckkomponent (konturer i en teckning) eller textur
+    (raster/skraffering). Det skiljer bilder från handskrift, som består av
+    många små, glesa streck i radband."""
+    if not HAVE_CV:
+        return []
+    h, w = norm.shape
+    den = cv2.medianBlur(norm, 3)
+    ink = cv2.adaptiveThreshold(den, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+                                max(15, (min(h, w) // 60) | 1), 18)
+    # Bara ord ur riktiga stycken räknas som text: Tesseract "läser" skräpord inne
+    # i teckningar ("Y=", "Qs", "|") med konfidens > 60 (WEG40122 s.61: 33 st),
+    # och maskas de blir serierutan en "textspalt". Stycke = Tesseracts (block, par).
+    groups: dict = {}
+    for wd in words:
+        groups.setdefault((wd.get("b"), wd.get("p")), []).append(wd)
+    real = set()
+    for ws in groups.values():
+        solid = sum(1 for x in ws if x["c"] >= 75 and sum(c.isalpha() for c in x["t"]) >= 2)
+        if len(ws) >= 3 and solid / len(ws) >= 0.5:
+            real.update(id(x) for x in ws)
+    word_mask = np.zeros((h, w), np.uint8)
+    for wd in words:
+        if id(wd) not in real or wd["c"] < 60:
+            continue
+        pad = int(0.3 * wd["h"])
+        word_mask[max(0, wd["y"] - pad):wd["y"] + wd["h"] + pad,
+                  max(0, wd["x"] - pad):wd["x"] + wd.get("w", wd["h"]) + pad] = 255
+    # Textspalter som solida block (ord + radmellanrum): bakgrundskonst bakom en
+    # spalt binder annars ihop hela sidan till en "figur" (WEG40122 s.61).
+    kb = max(5, int(0.025 * min(h, w)))
+    text_blocks = cv2.morphologyEx(word_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (kb, kb)))
+    ink[text_blocks > 0] = 0
+
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
+    cw, ch, ca = st[:, cv2.CC_STAT_WIDTH], st[:, cv2.CC_STAT_HEIGHT], st[:, cv2.CC_STAT_AREA]
+    thin = (cw > 20 * ch) | (ch > 20 * cw)  # linjal/spaltlinje/ram ensam är ingen bild
+    fill = ca / np.maximum(1, cw * ch)
+    # stor OCH tät: konturer i en teckning. Formulärramar/tabellrutnät är stora
+    # men glesa (krigsdagboken 1915) och får inte göra sidan till en "figur".
+    big = ((ch > 0.05 * h) | (cw > 0.15 * w)) & ~thin & (ca > 0.0005 * h * w) & (fill > 0.04)
+    big[0] = False
+
+    small = cv2.resize(ink, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
+    kk = max(5, int(0.04 * min(h, w) / 4))
+    dens = cv2.blur(small, (kk, kk))
+    texture = cv2.resize((dens > int(TEXTURE_DENSITY * 255)).astype(np.uint8), (w, h),
+                         interpolation=cv2.INTER_NEAREST)
+
+    k = max(5, int(0.012 * min(h, w)))
+    merged = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    merged[text_blocks > 0] = 0  # utsmetningen får inte bygga broar över textspalter
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(merged, 8)
+    cands = []
+    for j in range(1, n2):
+        x, y, bw, bh = st2[j, 0], st2[j, 1], st2[j, 2], st2[j, 3]
+        if bw < 0.08 * w or bh < 0.06 * h or bw * bh < 0.02 * w * h:
+            continue
+        for piece in _split_on_text([x, y, x + bw, y + bh], text_blocks):
+            cands.append(_trim_text_edges(piece, text_blocks))
+    boxes = []
+    for x0, y0, x1, y1 in cands:
+        x, y, bw, bh = x0, y0, x1 - x0, y1 - y0
+        if bw < 0.08 * w or bh < 0.06 * h or bw * bh < 0.02 * w * h:
+            continue
+        region = (slice(y, y + bh), slice(x, x + bw))
+        density = (ink[region] > 0).mean()
+        if density < 0.03:
+            continue
+        if (text_blocks[region] > 0).mean() > 0.35:  # mest text = textspalt med rester
+            continue
+        # Andel av regionens bläck som ligger i stora, täta komponenter. Handskrift
+        # = många små streck (låg andel), teckning = sammanhängande konturer.
+        labs = lab[region][ink[region] > 0]
+        big_share = big[labs].mean() if labs.size else 0.0
+        has_texture = texture[region].mean() > 0.15
+        if not (big_share >= 0.3 or has_texture):
+            continue
+        boxes.append([int(x), int(y), int(x + bw), int(y + bh)])
+
+    # slå ihop överlappande/närliggande rutor – men bara om resultatet blir
+    # kompakt. Två bilder i var sitt hörn (serieruta nere till vänster, konst uppe
+    # till höger) har överlappande rektanglar men är två bilder, inte en helsida.
+    gap = int(0.01 * max(h, w))
+
+    def area(b):
+        return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+    changed = True
+    while changed:
+        changed = False
+        for a in range(len(boxes)):
+            for b in range(a + 1, len(boxes)):
+                A, B = boxes[a], boxes[b]
+                U = [min(A[0], B[0]), min(A[1], B[1]), max(A[2], B[2]), max(A[3], B[3])]
+                touching = A[0] - gap <= B[2] and B[0] - gap <= A[2] and A[1] - gap <= B[3] and B[1] - gap <= A[3]
+                if touching and area(U) <= 1.25 * (area(A) + area(B)):
+                    boxes[a] = U
+                    boxes.pop(b)
+                    changed = True
+                    break
+            if changed:
+                break
+    pad = int(0.004 * max(h, w))
+    return [[max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)]
+            for x0, y0, x1, y1 in sorted(boxes, key=lambda b: (b[1], b[0]))]
+
+
 def prepare(gray: np.ndarray) -> tuple[np.ndarray, dict]:
     """Rotation + uträtning (gemensamt för alla OCR-varianter)."""
     info = {"rotated": 0, "skew": 0.0}
